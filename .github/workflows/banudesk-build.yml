@@ -1,0 +1,16 @@
+name: BanuDesk Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # New repositories give workflows a read-only token; publishing the
+    # installers to the "nightly" release needs write access.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: "nightly"

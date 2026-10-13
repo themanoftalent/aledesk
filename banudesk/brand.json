@@ -1,0 +1,8 @@
+{
+  "app_name": "BanuDesk",
+  "org": "tr.edu.bandirma",
+  "bundle_id": "tr.edu.bandirma.banudesk",
+  "manufacturer": "Bandirma Onyedi Eylul University",
+  "description": "BanuDesk Remote Desktop",
+  "copyright": "Copyright 2026 Bandirma Onyedi Eylul University. Based on RustDesk (AGPL-3.0)."
+}

@@ -1,0 +1,32 @@
+# BanuDesk server: ID server (hbbs), relay (hbbr) and API server (address book,
+# login, web admin) in one container, using the open-source
+# lejianwen/rustdesk-server-s6 image. Values come from .env (see setup.sh).
+services:
+  banudesk:
+    container_name: banudesk-server
+    image: lejianwen/rustdesk-server-s6:latest
+    restart: unless-stopped
+    ports:
+      - "21114:21114"       # API server and web admin (/_admin/)
+      - "21115:21115"       # NAT type test
+      - "21116:21116"       # ID server, TCP
+      - "21116:21116/udp"   # ID server, UDP (hole punching)
+      - "21117:21117"       # relay
+      - "21118:21118"       # web client, ID WebSocket (optional)
+      - "21119:21119"       # web client, relay WebSocket (optional)
+    environment:
+      TZ: Europe/Istanbul
+      RELAY: ${SERVER_HOST}:21117
+      ENCRYPTED_ONLY: "1"
+      MUST_LOGIN: "N"
+      RUSTDESK_API_LANG: en
+      RUSTDESK_API_RUSTDESK_ID_SERVER: ${SERVER_HOST}:21116
+      RUSTDESK_API_RUSTDESK_RELAY_SERVER: ${SERVER_HOST}:21117
+      RUSTDESK_API_RUSTDESK_API_SERVER: http://${SERVER_HOST}:21114
+      # The upstream README uses both names; setting both is harmless.
+      RUSTDESK_API_KEY_FILE: /data/id_ed25519.pub
+      RUSTDESK_API_RUSTDESK_KEY_FILE: /data/id_ed25519.pub
+      RUSTDESK_API_JWT_KEY: ${JWT_KEY}
+    volumes:
+      - ./data/server:/data     # hbbs/hbbr keys and database. Back this up.
+      - ./data/api:/app/data    # API database (users, address books)
