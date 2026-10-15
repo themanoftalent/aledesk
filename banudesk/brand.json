@@ -1,0 +1,8 @@
+{
+  "app_name": "AleDesk",
+  "org": "com.aledesk",
+  "bundle_id": "com.aledesk.aledesk",
+  "manufacturer": "AleDesk",
+  "description": "AleDesk Remote Desktop",
+  "copyright": "Copyright 2026 AleDesk. Based on RustDesk (AGPL-3.0)."
+}

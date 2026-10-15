@@ -1,0 +1,2 @@
+# The repository root ignores *svg; the brand sources must be committed.
+!*.svg

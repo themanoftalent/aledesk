@@ -1,0 +1,368 @@
+name: AleDesk Smoke Test
+
+# End-to-end test that uses no RustDesk-operated servers:
+#   server       Linux runner: AleDesk server (open-source hbbs/hbbr + API,
+#                same image as aledesk/server/docker-compose.yml) behind Caddy,
+#                published through a free Cloudflare quick tunnel (HTTPS, no account)
+#   windows-host installs the .msi, points it at that server, waits for a session
+#   mac-client   installs the .dmg, points it at that server, connects to Windows
+# Clients reach the server over WebSocket (wss://<tunnel>/ws/id and /ws/relay).
+# Screenshots and logs end up in the evidence-* artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test"
+        default: "nightly"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  TAG: ${{ inputs.tag || 'nightly' }}
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  RUN_ID: ${{ github.run_id }}
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Start Caddy and the Cloudflare tunnel
+        run: |
+          mkdir -p srv && cd srv
+          cat > Caddyfile <<'EOF'
+          :8080 {
+            handle /ws/id* {
+              reverse_proxy 127.0.0.1:21118
+            }
+            handle /ws/relay* {
+              reverse_proxy 127.0.0.1:21119
+            }
+            handle {
+              reverse_proxy 127.0.0.1:21114
+            }
+          }
+          EOF
+          docker run -d --name caddy --network host -v "$PWD/Caddyfile:/etc/caddy/Caddyfile" caddy:2
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 > tunnel.log 2>&1 &
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            [ -n "$URL" ] && break; sleep 2
+          done
+          [ -n "$URL" ] || { cat tunnel.log; exit 1; }
+          HOST=${URL#https://}
+          echo "HOST=$HOST" >> "$GITHUB_ENV"
+          echo "Tunnel: $URL"
+
+      - name: Start the AleDesk server (hbbs, hbbr, API)
+        run: |
+          cd srv
+          mkdir -p data/server data/api
+          docker run -d --name aledesk-server --network host \
+            -e RELAY="$HOST:21117" -e ENCRYPTED_ONLY=1 -e MUST_LOGIN=N \
+            -e RUSTDESK_API_LANG=en \
+            -e RUSTDESK_API_RUSTDESK_ID_SERVER="$HOST:21116" \
+            -e RUSTDESK_API_RUSTDESK_RELAY_SERVER="$HOST:21117" \
+            -e RUSTDESK_API_RUSTDESK_API_SERVER="https://$HOST" \
+            -e RUSTDESK_API_KEY_FILE=/data/id_ed25519.pub \
+            -e RUSTDESK_API_RUSTDESK_KEY_FILE=/data/id_ed25519.pub \
+            -e RUSTDESK_API_JWT_KEY="$(head -c 24 /dev/urandom | base64)" \
+            -v "$PWD/data/server:/data" -v "$PWD/data/api:/app/data" \
+            lejianwen/rustdesk-server-s6:latest
+          for i in $(seq 1 60); do [ -s data/server/id_ed25519.pub ] && break; sleep 2; done
+          [ -s data/server/id_ed25519.pub ] || { docker logs aledesk-server; exit 1; }
+          sudo cat data/server/id_ed25519.pub > ../key.txt
+          echo "Key: $(cat ../key.txt)"
+          # wait until the public URL answers through Cloudflare
+          for i in $(seq 1 60); do
+            C=$(curl -s -o /dev/null -w '%{http_code}' "https://$HOST/" || true)
+            echo "tunnel http: $C"; [ "$C" != "000" ] && [ "$C" != "530" ] && [ "$C" != "502" ] && break; sleep 3
+          done
+          mkdir -p ../info && echo -n "$HOST" > ../info/host.txt && cp ../key.txt ../info/key.txt
+
+      - name: Publish server address
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-info
+          path: info/
+          retention-days: 1
+
+      - name: Serve until the clients are done (max 30 min)
+        run: |
+          for i in $(seq 1 90); do
+            gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[].name' | grep -qx client-done && { echo "clients done"; break; }
+            sleep 20
+          done
+          mkdir -p evidence
+          docker logs aledesk-server > evidence/server.log 2>&1 || true
+          cp srv/tunnel.log evidence/ || true
+
+      - name: Upload server evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-server
+          path: evidence/
+          retention-days: 14
+
+  windows-host:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Download and install silently
+        shell: pwsh
+        run: |
+          gh release download $env:TAG -R $env:REPO -p "*x86_64.msi" -D dl
+          $msi = (Get-ChildItem dl/*.msi | Select-Object -First 1).FullName
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart /l*v msi-install.log" -Wait -PassThru
+          "msiexec exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Get-Content msi-install.log -Tail 60; exit 1 }
+          if (-not (Test-Path "C:\Program Files\AleDesk\AleDesk.exe")) { throw "AleDesk.exe not installed" }
+
+      - name: Wait for the server address
+        shell: pwsh
+        run: |
+          $url = ""
+          for ($i = 0; $i -lt 90 -and -not $url; $i++) {
+            $url = gh api "repos/$env:REPO/actions/runs/$env:RUN_ID/artifacts" --jq '.artifacts[]|select(.name=="server-info")|.archive_download_url'
+            if (-not $url) { Start-Sleep 10 }
+          }
+          if (-not $url) { throw "server never published its address" }
+          gh api $url > info.zip
+          Expand-Archive info.zip -DestinationPath info -Force
+          $h = (Get-Content info/host.txt -Raw).Trim(); $k = (Get-Content info/key.txt -Raw).Trim()
+          "SRV_HOST=$h" >> $env:GITHUB_ENV
+          "SRV_KEY=$k" >> $env:GITHUB_ENV
+          "server: $h  key: $k"
+
+      - name: Point AleDesk at the server
+        shell: pwsh
+        run: |
+          $exe = "C:\Program Files\AleDesk\AleDesk.exe"
+          # allow-websocket first: each change restarts the service's network
+          # layer, and a restart racing the next write can drop a setting.
+          $opts = [ordered]@{
+            "allow-websocket"          = "Y"
+            "custom-rendezvous-server" = $env:SRV_HOST
+            "relay-server"             = "$($env:SRV_HOST):21117"
+            "api-server"               = "https://$($env:SRV_HOST)"
+            "key"                      = $env:SRV_KEY
+          }
+          for ($round = 1; $round -le 5; $round++) {
+            foreach ($o in $opts.GetEnumerator()) {
+              $v = (cmd /c "`"$exe`" --option $($o.Key) | more" | Out-String).Trim()
+              if ($v -ne $o.Value) { cmd /c "`"$exe`" --option $($o.Key) $($o.Value) | more" | Out-Null; Start-Sleep 3 }
+            }
+            Start-Sleep 5
+            $bad = @()
+            foreach ($o in $opts.GetEnumerator()) {
+              $v = (cmd /c "`"$exe`" --option $($o.Key) | more" | Out-String).Trim()
+              "round ${round}: $($o.Key) = $v"
+              if ($v -ne $o.Value) { $bad += $o.Key }
+            }
+            if ($bad.Count -eq 0) { "all options applied"; break }
+          }
+          $bad = $bad | Where-Object { $_ -ne "allow-websocket" }
+          if ($bad.Count -gt 0) { throw "options not applied: $($bad -join ', ')" }
+
+      - name: Force WebSocket mode in the service config
+        shell: pwsh
+        run: |
+          $exe = "C:\Program Files\AleDesk\AleDesk.exe"
+          $v = (cmd /c "`"$exe`" --option allow-websocket | more" | Out-String).Trim()
+          if ($v -eq "Y") { "already Y"; exit 0 }
+          $svc = Get-Service | Where-Object { $_.Name -like "*AleDesk*" } | Select-Object -First 1
+          Stop-Service $svc.Name -Force; Start-Sleep 3
+          Get-Process | Where-Object { $_.ProcessName -like "*AleDesk*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          $dirs = @("C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AleDesk\config",
+                    "C:\Windows\System32\config\systemprofile\AppData\Roaming\AleDesk\config",
+                    "$env:APPDATA\AleDesk\config")
+          foreach ($d in $dirs) {
+            "dir $d exists: $(Test-Path $d)"
+            if (Test-Path $d) { Get-ChildItem $d | Select-Object Name, Length | Format-Table | Out-String }
+          }
+          foreach ($d in $dirs) {
+            New-Item -ItemType Directory -Force $d | Out-Null
+            $f = Join-Path $d "AleDesk2.toml"
+            $t = if (Test-Path $f) { Get-Content $f -Raw } else { "" }
+            if (-not $t) { $t = "" }
+            if ($t -match "allow-websocket") { $t = $t -replace "allow-websocket\s*=\s*'[^']*'", "allow-websocket = 'Y'" }
+            elseif ($t -match "(?m)^\[options\]") { $t = $t -replace "(?m)^\[options\]\r?\n", "[options]`nallow-websocket = 'Y'`n" }
+            else { $t = $t.TrimEnd() + "`n`n[options]`nallow-websocket = 'Y'`n" }
+            Set-Content $f $t -NoNewline
+            "patched $f"; Get-Content $f
+          }
+          Start-Service $svc.Name; Start-Sleep 15
+          $v = (cmd /c "`"$exe`" --option allow-websocket | more" | Out-String).Trim()
+          "allow-websocket after restart = '$v'"
+          if ($v -ne "Y") { "::warning::service reports allow-websocket='$v'; continuing to collect evidence" }
+
+      - name: Get ID and set a test password
+        shell: pwsh
+        run: |
+          $exe = "C:\Program Files\AleDesk\AleDesk.exe"
+          Start-Sleep 20
+          $id = (cmd /c "`"$exe`" --get-id | more" | Out-String).Trim()
+          if (-not ($id -match '^\d{6,}$')) { throw "no ID: '$id'" }
+          $pw = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object { [char]$_ })
+          $r = (cmd /c "`"$exe`" --password $pw | more" | Out-String).Trim()
+          if ($r -notmatch 'Done') { throw "could not set password: $r" }
+          New-Item -ItemType Directory -Force host | Out-Null
+          Set-Content host/id.txt $id -NoNewline
+          Set-Content host/pw.txt $pw -NoNewline
+          "Windows ID: $id"
+
+      - name: Publish host ID for the Mac
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-id
+          path: host/
+          retention-days: 1
+
+      - name: Open the app and watch for the session
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("evidence/$name.png"); $g.Dispose(); $bmp.Dispose()
+          }
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          Start-Process "C:\Program Files\AleDesk\AleDesk.exe"
+          Start-Sleep 20
+          Shot "win-1-home"
+          $deadline = (Get-Date).AddMinutes(25); $n = 0
+          while ((Get-Date) -lt $deadline) {
+            $arts = gh api "repos/$env:REPO/actions/runs/$env:RUN_ID/artifacts" --jq '.artifacts[].name'
+            if ($arts -contains "client-done") { "Mac client finished"; break }
+            $n++; Shot ("win-2-wait-{0:D2}" -f $n); Start-Sleep 20
+          }
+          Shot "win-3-end"
+          Get-ChildItem evidence/win-2-wait-*.png | Sort-Object Name | Select-Object -SkipLast 6 | Remove-Item
+
+      - name: Collect Windows logs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence/win-logs | Out-Null
+          Copy-Item msi-install.log evidence/win-logs/ -ErrorAction SilentlyContinue
+          foreach ($d in @("$env:APPDATA\AleDesk\log",
+                           "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AleDesk\log",
+                           "C:\Windows\System32\config\systemprofile\AppData\Roaming\AleDesk\log")) {
+            if (Test-Path $d) { Copy-Item "$d\*" evidence/win-logs/ -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+
+      - name: Upload Windows evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-windows
+          path: evidence/
+          retention-days: 14
+
+  mac-client:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Download and install
+        run: |
+          gh release download "$TAG" -R "$REPO" -p "*aarch64-aarch64.dmg" -D dl
+          M=$(hdiutil attach -nobrowse -readonly dl/*.dmg | tail -1 | awk -F'\t' '{print $NF}')
+          ditto "$M/AleDesk.app" /Applications/AleDesk.app
+          hdiutil detach -quiet "$M"
+          xattr -cr /Applications/AleDesk.app
+          codesign --verify --deep --strict /Applications/AleDesk.app && echo "signature OK"
+
+      - name: Wait for the server address
+        run: |
+          for i in $(seq 1 90); do
+            URL=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[]|select(.name=="server-info")|.archive_download_url')
+            [ -n "$URL" ] && break; sleep 10
+          done
+          [ -n "$URL" ] || { echo "server never published its address"; exit 1; }
+          gh api "$URL" > info.zip && unzip -o -q info.zip -d info
+          echo "SRV_HOST=$(cat info/host.txt)" >> "$GITHUB_ENV"
+          echo "SRV_KEY=$(cat info/key.txt)" >> "$GITHUB_ENV"
+
+      - name: Point AleDesk at the server and launch
+        run: |
+          D="$HOME/Library/Preferences/tr.edu.bandirma.AleDesk"
+          mkdir -p "$D" evidence
+          cat > "$D/AleDesk2.toml" <<EOF
+          [options]
+          custom-rendezvous-server = '$SRV_HOST'
+          relay-server = '$SRV_HOST:21117'
+          api-server = 'https://$SRV_HOST'
+          key = '$SRV_KEY'
+          allow-websocket = 'Y'
+          EOF
+          cat "$D/AleDesk2.toml"
+          open -a /Applications/AleDesk.app
+          sleep 25
+          pgrep -fl 'AleDesk.app/Contents/MacOS' || { echo "AleDesk is not running"; exit 1; }
+          screencapture -x evidence/mac-1-home.png || true
+
+      - name: Wait for the Windows host ID
+        run: |
+          for i in $(seq 1 90); do
+            URL=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[]|select(.name=="host-id")|.archive_download_url')
+            [ -n "$URL" ] && break; sleep 10
+          done
+          [ -n "$URL" ] || { echo "Windows host never published its ID"; exit 1; }
+          gh api "$URL" > host.zip && unzip -o -q host.zip -d host
+          echo "HOST_ID=$(cat host/id.txt)" >> "$GITHUB_ENV"
+          echo "HOST_PW=$(cat host/pw.txt)" >> "$GITHUB_ENV"
+
+      - name: Connect to the Windows host
+        run: |
+          brew install cliclick >/dev/null 2>&1 || true
+          /Applications/AleDesk.app/Contents/MacOS/AleDesk --connect "$HOST_ID" --password "$HOST_PW" &
+          sleep 25
+          screencapture -x evidence/mac-2-session-25s.png || true
+          # Through a Cloudflare tunnel only WebSocket works, so the host cannot
+          # register its key over UDP and AleDesk asks to confirm an unverified
+          # connection. Click "Continue" (bottom-left button of the dialog).
+          python3 - <<'PY'
+          import subprocess, re
+          out = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True).stdout
+          print(re.findall(r"Resolution: .*", out))
+          PY
+          cliclick c:984,538 || true
+          for t in 15 30 45 60; do
+            sleep 15
+            screencapture -x "evidence/mac-3-after-continue-${t}s.png" || true
+          done
+          grep -h -i -E 'websocket|wss://|connect|login|relay|peer|error|frame|video' ~/Library/Logs/AleDesk/*.log 2>/dev/null | tail -60 || true
+
+      - name: Signal done
+        if: always()
+        run: mkdir -p done && date > done/done.txt
+
+      - name: Release the host and server
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-done
+          path: done/
+          retention-days: 1
+
+      - name: Collect Mac logs
+        if: always()
+        run: mkdir -p evidence/mac-logs && cp -R ~/Library/Logs/AleDesk/. evidence/mac-logs/ 2>/dev/null || true
+
+      - name: Upload Mac evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-mac
+          path: evidence/
+          retention-days: 14
